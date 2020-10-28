@@ -74,7 +74,7 @@ type Raft struct {
 	heartbeat   int64 // last time heard from the leader
 	// Persistent state
 	currentTerm int
-	votedFor    uint
+	votedFor    int
 	logs        []LogEntry
 	// Volatile state
 	commitIndex uint
@@ -148,7 +148,7 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
 	CandidateId  int
-	LastLogIndex uint
+	LastLogIndex int
 	LastLogTerm  int
 }
 
@@ -172,6 +172,21 @@ type requestVoteRetEntry struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	DPrintf("receive RequestVote, whoami:%d, term:%d, candidateid:%d, lastlogindex:%d, lastlogterm:%d\n",
+		rf.me, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	if rf.role != follower || args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+	} else if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogIndex >= len(rf.logs) {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+	} else {
+		reply.VoteGranted = false
+	}
+	rf.mu.Unlock()
+	DPrintf("send apply RequestVote, whoami:%d, term:%d, votegranted:%t\n",
+		rf.me, reply.Term, reply.VoteGranted)
 }
 
 //
@@ -204,6 +219,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) __sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	DPrintf("send RequestVote, whoami:%d, term:%d, candidateid:%d, lastlogindex:%d, lastlogterm:%d\n",
+		rf.me, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -211,6 +228,8 @@ func (rf *Raft) __sendRequestVote(server int, args *RequestVoteArgs, reply *Requ
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, retChan chan *requestVoteRetEntry) {
 	var reply RequestVoteReply
 	ok := rf.__sendRequestVote(server, args, &reply)
+	DPrintf("receive apply RequestVote, whoami:%d, ok:%t, term:%d, votegranted:%t\n",
+		rf.me, ok, reply.Term, reply.VoteGranted)
 	var chanEntry requestVoteRetEntry
 	chanEntry.ok = ok
 	chanEntry.reply = &reply
@@ -278,6 +297,7 @@ func (rf *Raft) electionTimeout() {
 			term := rf.currentTerm
 			rf.currentTerm++
 			rf.role = candidate
+			rf.votedFor = rf.me
 			rf.mu.Unlock()
 
 			var args RequestVoteArgs
@@ -350,6 +370,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.votedFor = -1
 	go rf.electionTimeout()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
