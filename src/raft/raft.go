@@ -186,11 +186,11 @@ type retEntry struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintf("RequestVote req, me:%d, term:%d, candidateid:%d\n", rf.me, args.Term, args.CandidateId)
 	rf.mu.Lock()
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = follower
+		rf.votedFor = -1
 	}
 
 	reply.Term = rf.currentTerm
@@ -202,16 +202,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
-	DPrintf("RequestVote ack, me:%d, term:%d, votegranted:%t\n", rf.me, reply.Term, reply.VoteGranted)
 	rf.mu.Unlock()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("AppendEntries req, me:%d, term:%d, leaderid:%d\n", rf.me, args.Term, args.LeaderId)
 	rf.mu.Lock()
+	rf.lastHeartbeat = time.Now().UnixNano()
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = follower
+		rf.votedFor = -1
 	}
 
 	reply.Term = rf.currentTerm
@@ -222,9 +222,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.role == candidate {
 		rf.role = follower
-		rf.lastHeartbeat = time.Now().UnixNano()
+		rf.votedFor = -1
 	}
-	DPrintf("AppendEntries ack, me:%d, term:%d, success:%t\n", rf.me, reply.Term, reply.Success)
 	rf.mu.Unlock()
 }
 
@@ -258,7 +257,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the struct itself.
 //
 
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, retChan chan *retEntry) {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, retChan *chan retEntry, wg *sync.WaitGroup) {
 	var reply RequestVoteReply
 	DPrintf("RequestVote req, %d->%d, term:%d, candidateid:%d\n",
 		rf.me, server, args.Term, args.CandidateId)
@@ -267,11 +266,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, retChan chan 
 		server, rf.me, ok, reply.Term, reply.VoteGranted)
 	var chanEntry retEntry
 	chanEntry.ok = ok
-	chanEntry.reply = &reply
-	retChan <- &chanEntry
+	chanEntry.reply = reply
+	*retChan <- chanEntry
+	wg.Done()
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, retChan chan *retEntry) {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, retChan *chan retEntry, wg *sync.WaitGroup) {
 	var reply AppendEntriesReply
 	DPrintf("AppendEntries req, %d->%d, term:%d, leaderid:%d\n",
 		rf.me, server, args.Term, args.LeaderId)
@@ -280,8 +280,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, retChan c
 		server, rf.me, ok, reply.Term, reply.Success)
 	var chanEntry retEntry
 	chanEntry.ok = ok
-	chanEntry.reply = &reply
-	retChan <- &chanEntry
+	chanEntry.reply = reply
+	*retChan <- chanEntry
+	wg.Done()
 }
 
 //
@@ -341,25 +342,26 @@ func (rf *Raft) election() {
 		time.Sleep(time.Duration(timeout) * time.Millisecond)
 
 		rf.mu.Lock()
-		if rf.role != leader && time.Now().UnixNano() - rf.lastHeartbeat >= timeout * 1000000 {
-			term := rf.currentTerm
-			rf.currentTerm++
+		var interval = time.Now().UnixNano() - rf.lastHeartbeat
+		if rf.role != leader && interval >= timeout * 1000000 {
 			rf.role = candidate
+			rf.currentTerm++
 			rf.votedFor = rf.me
+			term := rf.currentTerm
 			rf.mu.Unlock()
 
-			DPrintf("election, me:%d, term:%d\n", rf.me, term)
+			DPrintf("timeout(%d), election, me:%d, term:%d\n", interval, rf.me, term)
 			var args RequestVoteArgs
 			args.Term = term
 			args.CandidateId = rf.me
 			// TODO: initiate LastLogIndex and LastLogTerm
 
 			wg := sync.WaitGroup{}
-			retChan := make(chan *retEntry)
+			retChan := make(chan retEntry)
 			for index, _ := range rf.peers {
 				if index != rf.me {
 					wg.Add(1)
-					go rf.sendRequestVote(index, &args, retChan)
+					go rf.sendRequestVote(index, &args, &retChan, &wg)
 				}
 			}
 
@@ -369,11 +371,9 @@ func (rf *Raft) election() {
 			}()
 
 			rf.mu.Lock()
-			DPrintf("get election results, me:%d, term:%d\n", rf.me, rf.currentTerm)
 			if rf.role == candidate && rf.currentTerm == term {
 				var voteNumber int
 				for entry := range retChan {
-					DPrintf("get ack, me:%d\n", rf.me)
 					// timeout
 					if entry.ok == false {
 						continue
@@ -382,6 +382,7 @@ func (rf *Raft) election() {
 					if entry.reply.(RequestVoteReply).Term > rf.currentTerm {
 						rf.currentTerm = entry.reply.(RequestVoteReply).Term
 						rf.role = follower
+						rf.votedFor = -1
 						break
 					}
 					// got a vote
@@ -393,6 +394,8 @@ func (rf *Raft) election() {
 				// wins the election
 				if rf.role == candidate && voteNumber * 2 > len(rf.peers) {
 					rf.role = leader
+					rf.votedFor = -1
+					DPrintf("win the election, me:%d, votenr:%d\n", rf.me, voteNumber)
 				}
 			}
 			rf.mu.Unlock()
@@ -408,11 +411,9 @@ func (rf *Raft) heartbeat() {
 			break
 		}
 
-		timeout := 100
-		time.Sleep(time.Duration(timeout) * time.Millisecond)
-
 		rf.mu.Lock()
 		if rf.role == leader {
+			DPrintf("send heartbeat, me:%d\n", rf.me)
 			term := rf.currentTerm
 			rf.mu.Unlock()
 
@@ -422,11 +423,11 @@ func (rf *Raft) heartbeat() {
 			//TODO initiate PrevLogIndex, PrevLogTerm, Entries and LeaderCommit
 
 			wg := sync.WaitGroup{}
-			retChan := make(chan *retEntry)
+			retChan := make(chan retEntry)
 			for index, _ := range rf.peers {
 				if index != rf.me {
 					wg.Add(1)
-					go rf.sendAppendEntries(index, &args, retChan)
+					go rf.sendAppendEntries(index, &args, &retChan, &wg)
 				}
 			}
 
@@ -443,9 +444,10 @@ func (rf *Raft) heartbeat() {
 						continue
 					}
 					// outdated
-					if entry.reply.(RequestVoteReply).Term > rf.currentTerm {
-						rf.currentTerm = entry.reply.(RequestVoteReply).Term
+					if entry.reply.(AppendEntriesReply).Term > rf.currentTerm {
+						rf.currentTerm = entry.reply.(AppendEntriesReply).Term
 						rf.role = follower
+						rf.votedFor = -1
 						break
 					}
 					// TODO: handle success
@@ -456,8 +458,8 @@ func (rf *Raft) heartbeat() {
 		} else {
 			rf.mu.Unlock()
 		}
+		time.Sleep(time.Duration(100) * time.Millisecond)
 	}
-
 }
 
 //
