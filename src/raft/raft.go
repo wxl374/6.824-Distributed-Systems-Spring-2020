@@ -195,20 +195,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-	} else {
+	} else if rf.role != leader {
 		if args.Term > rf.currentTerm {
+			rf.lastHeartbeat = time.Now().UnixNano()
 			rf.currentTerm = args.Term
-			DPrintf("role changed, me:%d, %s->%s\n",
-				rf.me, roleName[rf.role], roleName[follower])
+			DPrintf("role changed, me:%d, %s->%s\n", rf.me, roleName[rf.role], roleName[follower])
 			rf.role = follower
-			rf.votedFor = -1
 		}
 
 		reply.Term = rf.currentTerm
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId { // TODO: add conditions
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			rf.role = candidate
 		} else {
 			reply.VoteGranted = false
 		}
@@ -221,22 +219,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-	} else {
+	} else if rf.role != leader {
 		rf.lastHeartbeat = time.Now().UnixNano()
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
 			DPrintf("role changed, me:%d, %s->%s\n", rf.me, roleName[rf.role], roleName[follower])
 			rf.role = follower
-			rf.votedFor = -1
+			rf.votedFor = args.LeaderId
 		}
 
 		reply.Term = rf.currentTerm
 		reply.Success = true
-		if rf.role == candidate {
-			DPrintf("role changed, me:%d, %s->%s\n", rf.me, roleName[rf.role], roleName[follower])
-			rf.role = follower
-			rf.votedFor = -1
-		}
 	}
 	rf.mu.Unlock()
 }
@@ -353,11 +346,11 @@ func (rf *Raft) election() {
 		}
 
 		timeout := int64(rand.Intn(150) + 250) // [250, 400) ms
-		time.Sleep(time.Duration(timeout) * time.Millisecond)
+		time.Sleep(time.Duration(int64(50)) * time.Millisecond) // checking every 50 ms
 
 		rf.mu.Lock()
 		var interval = time.Now().UnixNano() - rf.lastHeartbeat
-		if rf.role != leader && interval >= timeout * 1000000 {
+		if rf.role != leader && rf.votedFor == -1 && interval >= timeout * 1000000 {
 			DPrintf("role changed, me:%d, %s->%s\n", rf.me, roleName[rf.role], roleName[candidate])
 			rf.role = candidate
 			rf.currentTerm++
@@ -396,10 +389,8 @@ func (rf *Raft) election() {
 					// outdated
 					if entry.reply.(RequestVoteReply).Term > rf.currentTerm {
 						rf.currentTerm = entry.reply.(RequestVoteReply).Term
-						DPrintf("role changed, me:%d, %s->%s\n",
-							rf.me, roleName[rf.role], roleName[follower])
+						DPrintf("role changed, me:%d, %s->%s\n", rf.me, roleName[rf.role], roleName[follower])
 						rf.role = follower
-						rf.votedFor = -1
 						continue
 					}
 					// got a vote
@@ -410,10 +401,8 @@ func (rf *Raft) election() {
 
 				// wins the election
 				if rf.role == candidate && voteNumber * 2 > len(rf.peers) {
-					DPrintf("role changed, me:%d, %s->%s\n",
-						rf.me, roleName[rf.role], roleName[leader])
+					DPrintf("role changed, me:%d, %s->%s\n", rf.me, roleName[rf.role], roleName[leader])
 					rf.role = leader
-					rf.votedFor = -1
 					DPrintf("win the election, me:%d, votenr:%d\n", rf.me, voteNumber)
 				}
 			}
@@ -465,10 +454,8 @@ func (rf *Raft) heartbeat() {
 					// outdated
 					if entry.reply.(AppendEntriesReply).Term > rf.currentTerm {
 						rf.currentTerm = entry.reply.(AppendEntriesReply).Term
-						DPrintf("role changed, me:%d, %s->%s\n",
-							rf.me, roleName[rf.role], roleName[follower])
+						DPrintf("role changed, me:%d, %s->%s\n", rf.me, roleName[rf.role], roleName[follower])
 						rf.role = follower
-						rf.votedFor = -1
 						continue
 					}
 					// TODO: handle success
